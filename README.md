@@ -11,17 +11,33 @@ Django API that returns a US driving route, approximate cost-effective fuel stop
 
 OSRM public demo and Nominatim are community services, not production SLAs. Respect the Nominatim usage policy, identify the application with a real User-Agent, cache repeat geocodes, and be prepared to switch providers. This implementation caches geocodes in-process; production should use a persistent cache (Redis/database) and configure rate limiting.
 
-## Setup
-Python 3.12+ recommended.
+## Project structure
 
-```bash
+```text
+Backend Django Engineer (Assessment)/
+├── README.md
+├── requirements.txt
+└── fuel_route_planner/
+    ├── db.sqlite3
+    ├── manage.py
+    └── main_config/
+        ├── __init__.py
+        ├── asgi.py
+        ├── settings.py
+        ├── urls.py
+        └── wsgi.py
+```
+
+## Setup
+
+Python 3.12+ recommended. Run these commands from the repository root—the folder containing `requirements.txt`.
+
+```powershell
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python manage.py runserver
+python .\fuel_route_planner\manage.py migrate
+python .\fuel_route_planner\manage.py runserver
 ```
 
 ## Endpoint
