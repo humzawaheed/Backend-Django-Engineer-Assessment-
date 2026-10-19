@@ -15,17 +15,35 @@ OSRM public demo and Nominatim are community services, not production SLAs. Resp
 
 ```text
 Backend Django Engineer (Assessment)/
+├── .gitignore
+├── LICENSE
 ├── README.md
 ├── requirements.txt
 └── fuel_route_planner/
     ├── db.sqlite3
     ├── manage.py
-    └── main_config/
+    ├── main_config/
+    │   ├── __init__.py
+    │   ├── asgi.py
+    │   ├── settings.py
+    │   ├── urls.py
+    │   └── wsgi.py
+    └── routes/
         ├── __init__.py
-        ├── asgi.py
-        ├── settings.py
-        ├── urls.py
-        └── wsgi.py
+        ├── admin.py
+        ├── apps.py
+        ├── models.py
+        ├── tests.py
+        ├── views.py
+        ├── data/
+        │   └── fuel-prices-for-be-assessment.csv
+        ├── migrations/
+        │   └── __init__.py
+        └── services/
+            ├── __init__.py
+            ├── fuel_calculator.py
+            ├── fuel_prices.py
+            └── routing.py
 ```
 
 ## Setup
