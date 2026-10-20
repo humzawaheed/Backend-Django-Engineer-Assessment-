@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fuel Route Planner Map</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  >
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    #status {
+      position: absolute;
+      z-index: 1000;
+      top: 10px;
+      left: 50px;
+      background: white;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font: 14px sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Loading route response…</div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map("map");
+    const status = document.getElementById("status");
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap contributors",
+      maxZoom: 19
+    }).addTo(map);
+
+    function addMarker(latitude, longitude, label, color) {
+      const marker = L.circleMarker([latitude, longitude], {
+        radius: 8,
+        color,
+        fillColor: color,
+        fillOpacity: 0.9
+      }).addTo(map);
+
+      const popup = document.createElement("div");
+      popup.textContent = label;
+      marker.bindPopup(popup);
+    }
+
+    fetch("./route-response.txt")
+      .then(response => {
+        if (!response.ok) {
+          throw new Error(`Could not load route response: HTTP ${response.status}`);
+        }
+        return response.json();
+      })
+      .then(data => {
+        if (data.error) {
+          throw new Error(data.error);
+        }
+
+        const coordinates = data.route.geometry?.coordinates;
+
+          if (!Array.isArray(coordinates) || coordinates.length < 2) {
+              throw new Error("The API response has no usable route coordinates.");
+          }
+
+          // GeoJSON and OSRM coordinates are [longitude, latitude];
+          // Leaflet polyline expects [latitude, longitude].
+          const routeLine = L.polyline(
+              coordinates.map(([longitude, latitude]) => [latitude, longitude]),
+              { color: "#1769aa", weight: 5 }
+          ).addTo(map);
+
+        addMarker(
+          data.start_coordinates.latitude,
+          data.start_coordinates.longitude,
+          `Start: ${data.start_location}`,
+          "#198754"
+        );
+
+        addMarker(
+          data.finish_coordinates.latitude,
+          data.finish_coordinates.longitude,
+          `Finish: ${data.finish_location}`,
+          "#dc3545"
+        );
+
+        const stops = data.fuel_plan.stops || [];
+        stops.forEach((stop, index) => {
+          addMarker(
+            stop.latitude,
+            stop.longitude,
+            `Fuel stop ${index + 1}: ${stop.name} — ${stop.city}, ${stop.state}; `
+              + `${stop.fuel_purchased_gallons} gallons; `
+              + `$${stop.estimated_purchase_cost}`,
+            "#f0a500"
+          );
+        });
+
+        const fuelPlan = data.fuel_plan;
+        const gallonsPurchased = stops.reduce(
+          (total, stop) => total + (Number(stop.fuel_purchased_gallons) || 0),
+          0
+        );
+        const formatUSD = amount =>
+          Number.isFinite(Number(amount))
+            ? `$${Number(amount).toFixed(2)}`
+            : "Unavailable";
+
+        status.textContent =
+          `${data.start_location} → ${data.finish_location} | `
+          + `${data.route.distance_miles} miles | ${stops.length} fuel stops | `
+          + `${fuelPlan.estimated_fuel_gallons} gal consumed `
+          + `(estimated total cost: ${formatUSD(fuelPlan.estimated_fuel_cost)}) | `
+          + `${gallonsPurchased.toFixed(2)} gal purchased `
+          + `(estimated en-route cost: `
+          + `${formatUSD(fuelPlan.estimated_en_route_purchase_cost)})`;
+
+        map.fitBounds(routeLine.getBounds(), { padding: [25, 25] });
+
+      })
+      .catch(error => {
+        status.textContent = `Map error: ${error.message}`;
+      });
+  </script>
+</body>
+</html>
