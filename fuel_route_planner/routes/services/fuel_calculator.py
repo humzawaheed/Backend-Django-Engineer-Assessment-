@@ -1,4 +1,3 @@
-
 """Select affordable fuel stops along a driving route."""
 
 import math
@@ -8,6 +7,7 @@ import pandas as pd
 
 
 EARTH_RADIUS_MILES = 3958.7613
+MIN_SAVINGS_PER_EXTRA_STOP_USD = 10.0
 
 
 
@@ -139,6 +139,7 @@ def _find_route_candidates(
     return candidates
 
 
+
 def calculate_fuel_plan(
     route,
     fuel_prices,
@@ -147,33 +148,61 @@ def calculate_fuel_plan(
     safety_margin_miles=50,
     corridor_miles=10,
 ):
-    """
-    Estimate trip fuel cost and select affordable, reachable fuel stops.
+    """Plan fuel stops with a full starting tank and explicit fuel purchases."""
 
-    Assumptions:
-    - The vehicle starts with a full tank.
-    - MPG and range are provided by the assessment.
-    - Candidate stations must be within corridor_miles of the route.
-    - Stops are planned with a safety margin for trips over vehicle range.
-    - Costs use the supplied dataset, not live fuel prices.
-    """
+    if not math.isfinite(mpg) or mpg <= 0:
+        raise ValueError("mpg must be a finite positive number.")
 
-    if mpg <= 0:
-        raise ValueError("mpg must be greater than zero.")
+    if not math.isfinite(range_miles) or range_miles <= 0:
+        raise ValueError("range_miles must be a finite positive number.")
 
-    if range_miles <= 0:
-        raise ValueError("range_miles must be greater than zero.")
-
-    if not 0 <= safety_margin_miles < range_miles:
+    if (
+        not math.isfinite(safety_margin_miles)
+        or not 0 <= safety_margin_miles < range_miles
+    ):
         raise ValueError(
-            "Safety margin must be non-negative and less than vehicle range."
+            "Safety margin must be non-negative and less than range."
         )
 
-    route_distance = float(route["distance_miles"])
-    total_gallons = route_distance / mpg
+    if not math.isfinite(corridor_miles) or corridor_miles < 0:
+        raise ValueError("corridor_miles must be non-negative.")
+
+    try:
+        route_distance = float(route["distance_miles"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Route must include a valid distance_miles value.")
+
+    if not math.isfinite(route_distance) or route_distance <= 0:
+        raise ValueError("Route distance must be a finite positive number.")
 
     if fuel_prices.empty:
         raise ValueError("No fuel-price records are available.")
+
+    required_columns = {
+        "OPIS Truckstop ID",
+        "Truckstop Name",
+        "Address",
+        "City",
+        "State",
+        "Retail Price",
+        "Latitude",
+        "Longitude",
+    }
+    missing = required_columns - set(fuel_prices.columns)
+    if missing:
+        raise ValueError(
+            f"Fuel-price data is missing columns: {sorted(missing)}"
+        )
+
+    prices = pd.to_numeric(fuel_prices["Retail Price"], errors="coerce")
+    prices = prices[np.isfinite(prices) & (prices > 0)]
+
+    if prices.empty:
+        raise ValueError("No valid positive fuel prices are available.")
+
+    usable_range_miles = range_miles - safety_margin_miles
+    tank_capacity_gallons = usable_range_miles / mpg
+    average_price = float(prices.mean())
 
     candidates = _find_route_candidates(
         route,
@@ -181,62 +210,50 @@ def calculate_fuel_plan(
         corridor_miles=corridor_miles,
     )
 
-    # A full tank can reach the destination: do not force a stop.
-    if route_distance <= range_miles:
-        if not candidates.empty:
-            reference_price = float(candidates["Retail Price"].mean())
-            price_basis = (
-                "Average listed price of stations near the route; "
-                "no en-route refueling is required."
-            )
-        else:
-            reference_price = float(fuel_prices["Retail Price"].mean())
-            price_basis = (
-                "Dataset-wide average price; no suitable route stations "
-                "were found for a local estimate."
-            )
+    base_result = {
+        "route_distance_miles": round(route_distance, 2),
+        "estimated_fuel_gallons": round(route_distance / mpg, 2),
+        "estimated_fuel_cost": round(
+            (route_distance / mpg) * average_price, 2
+        ),
+        "estimated_cost_basis": (
+            "Estimated total trip fuel-consumption cost using the mean "
+            "listed dataset price. Assumes a full tank at departure; "
+            "en-route purchases are reported separately."
+        ),
+        "refueling_required": route_distance > usable_range_miles,
+        "stops": [],
+        "legs": [],
+        "estimated_en_route_purchase_cost": 0.0,
+        "message": "",
+    }
 
-        return {
-            "route_distance_miles": round(route_distance, 2),
-            "estimated_fuel_gallons": round(total_gallons, 2),
-            "estimated_fuel_cost": round(
-                total_gallons * reference_price, 2
-            ),
-            "estimated_cost_basis": price_basis,
-            "refueling_required": False,
-            "stops": [],
-            "message": (
-                "The destination is within the assumed full-tank range."
-            ),
-        }
+    if route_distance <= usable_range_miles:
+        base_result["refueling_required"] = False
+        base_result["message"] = (
+            "The destination is within the usable range of the assumed "
+            "full starting tank."
+        )
+        return base_result
 
     if candidates.empty:
-        return {
-            "route_distance_miles": round(route_distance, 2),
-            "estimated_fuel_gallons": round(total_gallons, 2),
-            "estimated_fuel_cost": None,
-            "estimated_cost_basis": (
-                "No feasible plan: no fuel stations were found within "
-                f"{corridor_miles} miles of the route."
-            ),
-            "refueling_required": True,
-            "stops": [],
-            "message": (
-                "No suitable fuel stations were found near the route. "
-                "Try a wider route corridor or check the dataset."
-            ),
-        }
+        base_result["estimated_fuel_cost"] = None
+        base_result["estimated_en_route_purchase_cost"] = None
+        base_result["estimated_cost_basis"] = (
+            "No feasible estimate: no candidate fuel stations were found "
+            "within the configured route corridor."
+        )
+        base_result["message"] = (
+            "No suitable fuel stations were found near the route. "
+            "Try widening the corridor or checking station coordinates."
+        )
+        return base_result
 
-    # Build nodes: start, candidate stations, and destination.
-    station_nodes = candidates.to_dict("records")
+    nodes = [
+        {"kind": "start", "progress": 0.0, "off_route": 0.0}
+    ]
 
-    nodes = [{
-        "kind": "start",
-        "progress": 0.0,
-        "off_route": 0.0,
-    }]
-
-    for station in station_nodes:
+    for station in candidates.to_dict("records"):
         nodes.append({
             "kind": "station",
             "progress": float(station["Route Progress Miles"]),
@@ -249,156 +266,273 @@ def calculate_fuel_plan(
         "progress": route_distance,
         "off_route": 0.0,
     })
-
     nodes.sort(key=lambda node: node["progress"])
 
     start_index = next(
-        i for i, node in enumerate(nodes) if node["kind"] == "start"
+        index for index, node in enumerate(nodes)
+        if node["kind"] == "start"
     )
     destination_index = next(
-        i for i, node in enumerate(nodes)
+        index for index, node in enumerate(nodes)
         if node["kind"] == "destination"
     )
 
-    # Only allow planned legs up to 450 miles by default,
-    # leaving a 50-mile safety margin on a 500-mile range.
-    max_leg_miles = range_miles - safety_margin_miles
-    count = len(nodes)
-
-    best_cost = [float("inf")] * count
-    previous = [None] * count
-    best_cost[start_index] = 0.0
-
-    for j in range(start_index + 1, destination_index + 1):
-        current = nodes[j]
-
-        for i in range(start_index, j):
-            if not math.isfinite(best_cost[i]):
-                continue
-
-            prior = nodes[i]
-            leg_distance = (
-                current["progress"]
-                - prior["progress"]
-                + prior["off_route"]
-                + current["off_route"]
-            )
-
-            if leg_distance <= 0 or leg_distance > max_leg_miles:
-                continue
-
-            # The first leg is priced using the first stop.
-            # Later legs are priced using the station departed from.
-            if prior["kind"] == "start":
-                if current["kind"] != "station":
-                    continue
-                price = float(current["station"]["Retail Price"])
-            else:
-                price = float(prior["station"]["Retail Price"])
-
-            leg_cost = (leg_distance / mpg) * price
-            proposed_cost = best_cost[i] + leg_cost
-
-            if proposed_cost < best_cost[j]:
-                best_cost[j] = proposed_cost
-                previous[j] = i
-
-    if not math.isfinite(best_cost[destination_index]):
-        return {
-            "route_distance_miles": round(route_distance, 2),
-            "estimated_fuel_gallons": round(total_gallons, 2),
-            "estimated_fuel_cost": None,
-            "estimated_cost_basis": (
-                "No feasible plan within the configured range and safety "
-                "margin using the available route stations."
-            ),
-            "refueling_required": True,
-            "stops": [],
-            "message": (
-                "A safe fuel-stop plan could not be found. Try widening "
-                "the route corridor or reviewing missing station data."
-            ),
-        }
-
-    # Reconstruct the cheapest feasible station sequence.
-    path_indices = []
-    current_index = destination_index
-
-    while current_index != start_index:
-        current_index = previous[current_index]
-
-        if current_index is None:
-            raise RuntimeError("Failed to reconstruct fuel-stop plan.")
-
-        if nodes[current_index]["kind"] == "station":
-            path_indices.append(current_index)
-
-    path_indices.reverse()
-
-    selected_stops = []
-    previous_node = nodes[start_index]
-
-    for index in path_indices:
-        node = nodes[index]
-        station = node["station"]
-
-        leg_distance = (
-            node["progress"]
-            - previous_node["progress"]
-            + previous_node["off_route"]
-            + node["off_route"]
+    def distance_between(first, second):
+        return (
+            second["progress"] - first["progress"]
+            + first["off_route"]
+            + second["off_route"]
         )
 
-        # Price estimate for the leg ending at this stop.
-        # For the initial leg, this is the arriving station's price.
-        if previous_node["kind"] == "start":
-            leg_price = float(station["Retail Price"])
-        else:
-            leg_price = float(
-                previous_node["station"]["Retail Price"]
+    # The assumed starting tank is full. Reach the furthest station that
+    # can be reached before using the safety reserve.
+    start_node = nodes[start_index]
+    reachable_from_start = [
+        index
+        for index in range(start_index + 1, destination_index)
+        if nodes[index]["kind"] == "station"
+        and 0 < distance_between(start_node, nodes[index])
+        <= usable_range_miles
+    ]
+
+    if not reachable_from_start:
+        base_result["estimated_fuel_cost"] = None
+        base_result["estimated_en_route_purchase_cost"] = None
+        base_result["estimated_cost_basis"] = (
+            "No feasible plan: no fuel station is reachable from the "
+            "starting location within the usable tank range."
+        )
+        base_result["message"] = (
+            "No fuel station can be reached before the safety reserve. "
+            "Try widening the corridor or checking station coordinates."
+        )
+        return base_result
+
+    current_index = max(
+        reachable_from_start,
+        key=lambda index: nodes[index]["progress"],
+    )
+    current_node = nodes[current_index]
+    fuel_remaining_miles = (
+        usable_range_miles
+        - distance_between(start_node, current_node)
+    )
+
+    legs = [{
+        "from": "start",
+        "to": str(current_node["station"]["Truckstop Name"]),
+        "distance_miles": round(
+            distance_between(start_node, current_node), 2
+        ),
+        "fuel_gallons": round(
+            distance_between(start_node, current_node) / mpg, 2
+        ),
+        "fuel_source": "assumed_starting_tank",
+        "estimated_purchase_cost": 0.0,
+    }]
+    stops = []
+    total_purchase_cost = 0.0
+    visited_indexes = {current_index}
+
+    while current_index != destination_index:
+        current_node = nodes[current_index]
+        destination_node = nodes[destination_index]
+        distance_to_destination = distance_between(
+            current_node, destination_node
+        )
+
+        if distance_to_destination <= fuel_remaining_miles:
+            legs.append({
+                "from": str(current_node["station"]["Truckstop Name"]),
+                "to": "destination",
+                "distance_miles": round(distance_to_destination, 2),
+                "fuel_gallons": round(distance_to_destination / mpg, 2),
+                "fuel_source": "fuel_remaining_in_tank",
+                "estimated_purchase_cost": 0.0,
+            })
+            current_index = destination_index
+            break
+
+        current_station = current_node["station"]
+        current_price = float(current_station["Retail Price"])
+
+        reachable_stations = [
+            index
+            for index in range(current_index + 1, destination_index)
+            if nodes[index]["kind"] == "station"
+            and index not in visited_indexes
+            and 0 < distance_between(current_node, nodes[index])
+            <= usable_range_miles
+        ]
+
+        cheaper_stations = []
+
+        for index in reachable_stations:
+            candidate_price = float(
+                nodes[index]["station"]["Retail Price"]
+            )
+            if candidate_price >= current_price:
+                continue
+
+            distance_to_candidate = distance_between(
+                current_node, nodes[index]
+            )
+            distance_after_candidate = max(
+                0.0,
+                distance_to_destination - distance_to_candidate,
             )
 
-        selected_stops.append({
-            "truckstop_id": int(station["OPIS Truckstop ID"]),
-            "name": str(station["Truckstop Name"]),
-            "address": str(station["Address"]),
-            "city": str(station["City"]),
-            "state": str(station["State"]),
-            "latitude": float(station["Latitude"]),
-            "longitude": float(station["Longitude"]),
-            "retail_price": float(station["Retail Price"]),
-            "distance_from_route_miles": round(
-                float(station["Distance From Route Miles"]), 2
+            # Estimate the savings over at most one usable tank range.
+            gallons_compared = (
+                min(distance_after_candidate, usable_range_miles) / mpg
+            )
+            estimated_savings = (
+                gallons_compared * (current_price - candidate_price)
+            )
+
+            if estimated_savings > MIN_SAVINGS_PER_EXTRA_STOP_USD:
+                cheaper_stations.append(index)
+
+        if cheaper_stations:
+            # Buy only enough to reach the nearest cheaper station.
+            target_index = min(
+                cheaper_stations,
+                key=lambda index: distance_between(
+                    current_node, nodes[index]
+                ),
+            )
+            target_node = nodes[target_index]
+            target_distance = distance_between(current_node, target_node)
+            purchase_gallons = max(
+                0.0,
+                (target_distance - fuel_remaining_miles) / mpg,
+            )
+        else:
+            if distance_to_destination <= usable_range_miles:
+                target_index = destination_index
+                target_node = destination_node
+                target_distance = distance_to_destination
+                purchase_gallons = max(
+                    0.0,
+                    (target_distance - fuel_remaining_miles) / mpg,
+                )
+            else:
+                if not reachable_stations:
+                    base_result["estimated_fuel_cost"] = None
+                    base_result["estimated_en_route_purchase_cost"] = None
+                    base_result["estimated_cost_basis"] = (
+                        "No feasible plan: no station is reachable from "
+                        "the current stop within the usable tank range."
+                    )
+                    base_result["message"] = (
+                        "A safe fuel-stop plan could not be found. "
+                        "Try widening the corridor or reviewing station "
+                        "coverage."
+                    )
+                    return base_result
+
+                # No cheaper station is reachable after filling. Fill the
+                # tank, then head to the cheapest reachable station.
+                target_index = min(
+                    reachable_stations,
+                    key=lambda index: (
+                        float(nodes[index]["station"]["Retail Price"]),
+                        -nodes[index]["progress"],
+                    ),
+                )
+                target_node = nodes[target_index]
+                target_distance = distance_between(
+                    current_node, target_node
+                )
+                purchase_gallons = max(
+                    0.0,
+                    tank_capacity_gallons
+                    - fuel_remaining_miles / mpg,
+                )
+
+        if purchase_gallons > tank_capacity_gallons:
+            base_result["estimated_fuel_cost"] = None
+            base_result["estimated_en_route_purchase_cost"] = None
+            base_result["message"] = (
+                "A safe fuel-stop plan could not be found with the "
+                "configured tank range."
+            )
+            return base_result
+
+        purchase_cost = purchase_gallons * current_price
+        fuel_remaining_miles += purchase_gallons * mpg
+        fuel_remaining_miles = min(
+            fuel_remaining_miles,
+            usable_range_miles,
+        )
+
+        if purchase_gallons > 0:
+            total_purchase_cost += purchase_cost
+            stops.append({
+                "truckstop_id": int(current_station["OPIS Truckstop ID"]),
+                "name": str(current_station["Truckstop Name"]),
+                "address": str(current_station["Address"]),
+                "city": str(current_station["City"]),
+                "state": str(current_station["State"]),
+                "latitude": float(current_station["Latitude"]),
+                "longitude": float(current_station["Longitude"]),
+                "retail_price": current_price,
+                "distance_from_route_miles": round(
+                    float(current_node["off_route"]), 2
+                ),
+                "route_progress_miles": round(
+                    float(current_node["progress"]), 2
+                ),
+                "fuel_purchased_gallons": round(purchase_gallons, 2),
+                "estimated_purchase_cost": round(purchase_cost, 2),
+                "estimated_leg_cost": round(purchase_cost, 2),
+            })
+
+        fuel_remaining_miles -= target_distance
+        legs.append({
+            "from": str(current_station["Truckstop Name"]),
+            "to": (
+                "destination"
+                if target_node["kind"] == "destination"
+                else str(target_node["station"]["Truckstop Name"])
             ),
-            "route_progress_miles": round(
-                float(station["Route Progress Miles"]), 2
+            "distance_miles": round(target_distance, 2),
+            "fuel_gallons": round(target_distance / mpg, 2),
+            "fuel_source": (
+                "fuel_purchased_at_previous_stop"
+                if purchase_gallons > 0
+                else "fuel_remaining_in_tank"
             ),
-            "leg_distance_from_previous_miles": round(
-                leg_distance, 2
-            ),
-            "leg_fuel_gallons": round(leg_distance / mpg, 2),
-            "estimated_leg_cost": round(
-                (leg_distance / mpg) * leg_price, 2
-            ),
+            "estimated_purchase_cost": round(purchase_cost, 2),
         })
 
-        previous_node = node
+        if target_index == destination_index:
+            current_index = destination_index
+            break
 
-    return {
-        "route_distance_miles": round(route_distance, 2),
-        "estimated_fuel_gallons": round(total_gallons, 2),
-        "estimated_fuel_cost": round(best_cost[destination_index], 2),
-        "estimated_cost_basis": (
-            "Estimated from route-leg fuel consumption and CSV station "
-            "prices. The first leg uses the first stop's listed price; "
-            "subsequent legs use the price at the previous stop. "
-            "Actual purchase costs may differ."
-        ),
-        "refueling_required": bool(selected_stops),
-        "stops": selected_stops,
-        "message": (
-            f"Selected {len(selected_stops)} fuel stop(s)."
-            if selected_stops
-            else "No en-route fuel stops are required."
-        ),
-    }
+        if fuel_remaining_miles < -1e-9:
+            base_result["estimated_fuel_cost"] = None
+            base_result["estimated_en_route_purchase_cost"] = None
+            base_result["message"] = (
+                "A safe fuel-stop plan could not be found with the "
+                "configured tank range."
+            )
+            return base_result
+
+        current_index = target_index
+        visited_indexes.add(current_index)
+
+    base_result["stops"] = stops
+    base_result["legs"] = legs
+    base_result["refueling_required"] = bool(stops)
+    base_result["estimated_en_route_purchase_cost"] = round(
+        total_purchase_cost, 2
+    )
+    base_result["message"] = (
+        f"Selected {len(stops)} fuel stop(s). "
+        f"Usable range includes a {safety_margin_miles:g}-mile "
+        "safety reserve."
+    )
+    return base_result
+
+
