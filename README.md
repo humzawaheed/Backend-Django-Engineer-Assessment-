@@ -1,27 +1,24 @@
 # Fuel Route Planner API
 
-Django API that returns a US driving route, approximate cost-effective fuel stops, and estimated fuel cost using the supplied fuel-price file.
+A Django API that returns a US driving route, suggested fuel stops, and estimated fuel costs using the supplied fuel-price dataset.
 
-## Stack and external services
-- Django **6.1.2** (latest stable at project creation)
-- OSRM public demo server for road routing (one routing request per uncached request)
-- OpenStreetMap Nominatim for start/end geocoding (two geocoding requests per uncached request)
-- GeoNames city gazetteer (`geonamescache`) for approximate fuel-station city coordinates
-- Fuel prices stored locally in `planner/data/fuel_prices.csv`
+## Requirements
 
-OSRM public demo and Nominatim are community services, not production SLAs. Respect the Nominatim usage policy, identify the application with a real User-Agent, cache repeat geocodes, and be prepared to switch providers. This implementation caches geocodes in-process; production should use a persistent cache (Redis/database) and configure rate limiting.
+- Python 3.12 or later recommended
+- Git
+- Internet access for geocoding, routing, and map tiles
+
+The API uses OpenStreetMap Nominatim for geocoding and the public OSRM demo server for routing. These community services can be slow or unavailable and are not intended to provide production service guarantees.
 
 ## Project structure
 
 ```text
 Backend Django Engineer (Assessment)/
-├── .gitignore
-├── LICENSE
 ├── README.md
 ├── requirements.txt
 └── fuel_route_planner/
-    ├── db.sqlite3
     ├── manage.py
+    ├── route-map.html
     ├── main_config/
     │   ├── __init__.py
     │   ├── asgi.py
@@ -34,57 +31,141 @@ Backend Django Engineer (Assessment)/
         ├── apps.py
         ├── models.py
         ├── tests.py
+        ├── urls.py
         ├── views.py
         ├── data/
-        │   └── fuel-prices-for-be-assessment.csv
+        │   ├── fuel-prices-for-be-assessment.csv
+        │   └── fuel-prices-with-coordinates.csv
         ├── migrations/
         │   └── __init__.py
         └── services/
             ├── __init__.py
+            ├── city_coordinates.py
             ├── fuel_calculator.py
             ├── fuel_prices.py
             └── routing.py
 ```
 
+The local SQLite database is created when you run migrations. Local environment files, the virtual environment, and Python cache files are not required in the repository.
+
 ## Setup
 
-Python 3.12+ recommended. Run these commands from the repository root—the folder containing `requirements.txt`.
+Run commands from the repository root—the folder containing `requirements.txt`.
+
+### Windows PowerShell
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python .\fuel_route_planner\manage.py migrate
+python .\fuel_route_planner\manage.py check
 python .\fuel_route_planner\manage.py runserver
 ```
 
-## Endpoint
-`POST http://127.0.0.1:8000/api/route-plan/`
+If PowerShell blocks virtual-environment activation, use Git Bash instead.
 
-JSON:
+### Windows Git Bash
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+python -m pip install -r requirements.txt
+python fuel_route_planner/manage.py migrate
+python fuel_route_planner/manage.py check
+python fuel_route_planner/manage.py runserver
+```
+
+### macOS or Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python fuel_route_planner/manage.py migrate
+python fuel_route_planner/manage.py check
+python fuel_route_planner/manage.py runserver
+```
+
+The development server runs at `http://127.0.0.1:8000/`. Keep its terminal open while sending API requests.
+
+## API
+
+**Endpoint:** `POST http://127.0.0.1:8000/api/plan-route/`
+
+**Content-Type:** `application/json`
+
+Example request:
+
 ```json
 {
-  "start": "Austin, Texas, USA",
-  "finish": "Dallas, Texas, USA"
+  "start_location": "New York, NY",
+  "finish_location": "Los Angeles, CA"
 }
 ```
 
-Returns `distance_miles`, `estimated_fuel_gallons`, `estimated_total_fuel_cost_usd`, `fuel_stops`, and a GeoJSON `route_geometry` that can be rendered on a map (for example Leaflet). Errors return JSON with a 4xx/5xx status.
+Example using `curl` from Git Bash, run from the `fuel_route_planner` directory:
 
-## Postman quick test
-1. Method `POST`, URL `http://127.0.0.1:8000/api/route-plan/`
-2. Body > raw > JSON; paste the request above.
-3. Send. The first request may take longer while geocoding; repeated endpoint geocoding is cached for the life of the process.
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/api/plan-route/" \
+  -H "Content-Type: application/json" \
+  -d '{"start_location":"New York, NY","finish_location":"Los Angeles, CA"}'
+```
 
-## Fuel-price data limitations and optimization notes
-The supplied file has station names, city/state, address text and price, but no latitude/longitude. The app matches city/state to a local GeoNames gazetteer and treats each station as located at its city coordinate. This is a deliberate zero-extra-geocoding-call trade-off, but means nearby stations in the same city may appear at the same approximate point. Some smaller cities may not be in the gazetteer; run `python manage.py check_data` to inspect coverage.
+To save the JSON response to a local file instead of displaying the full route geometry in the terminal:
 
-The dynamic-programming planner considers stations within 35 straight-line miles of the route, buckets candidates into 10-mile route segments, and chooses a low-cost sequence where no leg exceeds 500 miles. Since the input does not specify starting fuel level or station-level coordinates, total cost is an estimate under the assumptions returned by the API. A production-grade result should enrich the dataset with actual station coordinates and model starting fuel / tank capacity explicitly.
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/api/plan-route/" \
+  -H "Content-Type: application/json" \
+  -d '{"start_location":"New York, NY","finish_location":"Los Angeles, CA"}' \
+  -o route-response.txt
+```
 
-## API call count
-For a cache-cold request: two Nominatim geocoding requests + one OSRM route request. Fuel stations are never individually geocoded. Geocodes are process-cached; use persistent caching for multi-worker deployments.
+The response includes the resolved locations, route distance and geometry, vehicle assumptions, fuel plan, and a note about the supplied price data. Invalid JSON or missing required fields returns a JSON error response.
 
-## Useful references
-- Django downloads: https://www.djangoproject.com/download/
-- OSRM HTTP API: https://project-osrm.org/docs/
-- Nominatim usage policy: https://operations.osmfoundation.org/policies/nominatim/
+## Optional route map
+
+The project includes `fuel_route_planner/route-map.html`, which can display the saved `route-response.txt` response on an interactive map.
+
+After generating `route-response.txt`, open a second terminal, change to the `fuel_route_planner` directory, and start a local file server:
+
+```bash
+python -m http.server 8001
+```
+
+Then open `http://127.0.0.1:8001/route-map.html` in a browser. Keep the file server running while viewing the map. The map uses Leaflet and OpenStreetMap tiles, so the browser needs internet access.
+
+## Tests
+
+Run the Django checks and route-app tests from the repository root:
+
+```bash
+python fuel_route_planner/manage.py check
+python fuel_route_planner/manage.py test routes
+```
+
+If already in the `fuel_route_planner` directory, use:
+
+```bash
+python manage.py check
+python manage.py test routes
+```
+
+## Fuel data and estimate limitations
+
+Fuel prices are loaded from `fuel_route_planner/routes/data/fuel-prices-with-coordinates.csv`. The file contains the supplied price data with added coordinates. Coordinates may approximate a station's city rather than its exact location, so route proximity and stop locations are estimates. Prices are from the supplied dataset and may not be current.
+
+The planner assumes a 10 MPG vehicle and a full tank at departure. Its fuel-stop calculations are estimates based on the available station candidates and configured range/safety assumptions; they are not a guarantee of the globally cheapest real-world refueling plan. The API distinguishes estimated total trip fuel-consumption cost from estimated purchases made en route.
+
+On a cache-cold request, the application makes up to two Nominatim geocoding requests and one OSRM routing request. Geocoded locations are cached in process memory; the cache is not shared across server workers or retained after restart.
+
+## Development and production
+
+`runserver` is Django's development server and is for local testing only. Do not deploy with development settings or the development secret key. Public Nominatim and OSRM demo services do not provide production SLAs; a production deployment should use suitable providers, persistent caching, rate limiting, and production Django settings.
+
+## References
+
+- [Django documentation](https://docs.djangoproject.com/)
+- [OSRM API documentation](https://project-osrm.org/docs/)
+- [Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/)
+- [Leaflet documentation](https://leafletjs.com/)
